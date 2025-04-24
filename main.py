@@ -5,37 +5,29 @@ import csv
 import pandas as pd
 import ta
 import requests
+import numpy as np
 from dotenv import load_dotenv
-from collections import deque
 from datetime import datetime, timezone
 
 # Chargement des clés API
 load_dotenv()
 api_key = os.getenv("BINANCE_API_KEY")
 secret_key = os.getenv("BINANCE_SECRET_KEY")
-mode = os.getenv("MODE", "SIMU")
-
-# Portefeuille fictif et seuils de sécurité
-portfolio = {'USDC': 1000, 'BTC': 0}
-MIN_USDC = 10
-MIN_BTC = 0.00001
-last_buy_price = None
-trade_count = 0
-max_trades = 10
-start_time = time.time()
-max_runtime = 60 * 60  # 1 heure
 
 # Connexion Binance
 binance = ccxt.binance({
     'apiKey': api_key,
     'secret': secret_key,
     'enableRateLimit': True,
-    'timeout': 30000  # 30 secondes
+    'timeout': 30000
 })
 
 # Telegram
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+# Paramètre de gain minimum (en pourcentage)
+MIN_PROFIT_PCT = 0.2  # Par exemple, 0.2% minimum requis pour vendre
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -48,19 +40,6 @@ def send_telegram(message):
             print(f"❌ Échec Telegram : {r.status_code} {r.text}")
     except Exception as e:
         print(f"❌ Erreur Telegram : {e}")
-
-history = deque(maxlen=30)
-timestamps, prices = [], []
-df = pd.DataFrame({
-    "timestamp": pd.Series(dtype='datetime64[ns]'),
-    "price": pd.Series(dtype='float'),
-    "sma20": pd.Series(dtype='float'),
-    "rsi": pd.Series(dtype='float'),
-    "macd": pd.Series(dtype='float'),
-    "macd_signal": pd.Series(dtype='float'),
-    "bb_upper": pd.Series(dtype='float'),
-    "bb_lower": pd.Series(dtype='float')
-})
 
 def get_price():
     try:
@@ -76,114 +55,79 @@ def get_real_balance():
     btc = balance['total'].get('BTC', 0)
     return {'USDC': usdc, 'BTC': btc}
 
-def log_trade(action, amount, price, value):
+def log_trade(action, amount, price, total):
     file_exists = os.path.isfile('trades.csv')
     with open('trades.csv', mode='a', newline='') as file:
         writer = csv.writer(file)
         if not file_exists:
-            writer.writerow(['timestamp', 'action', 'amount', 'price', 'value'])
+            writer.writerow(['timestamp', 'action', 'amount', 'price', 'total'])
         writer.writerow([
             datetime.now(timezone.utc).isoformat(),
             action,
             f"{amount:.8f}",
             f"{price:.2f}",
-            f"{value:.2f}"
+            f"{total:.2f}"
         ])
 
 def real_buy(price):
-    usdc = get_real_balance()['USDC']
-    if usdc < MIN_USDC:
+    balance = get_real_balance()
+    usdc = balance['USDC']
+    if usdc < 10:
         print("❌ Solde USDC insuffisant pour acheter.")
-        return
-    quantity = round(usdc / price, 6)
+        return None
+    quantity = round((usdc / price) * 0.995, 6)  # Marge de sécurité de 0.5%
     order = binance.create_market_buy_order('BTC/USDC', quantity)
     print("🟢 Ordre d'achat envoyé :", order)
+    log_trade("BUY", quantity, price, order['cost'])
+    return price
 
-def real_sell(price):
-    btc = get_real_balance()['BTC']
-    if btc < MIN_BTC:
-        print("❌ Solle BTC insuffisant pour vendre.")
+def real_sell(price, last_buy_price):
+    balance = get_real_balance()
+    btc = balance['BTC']
+    if btc < 0.00001:
+        print("❌ Solde BTC insuffisant pour vendre.")
         return
-    quantity = round(btc, 6)
+    quantity = round(btc * 0.995, 6)  # Marge de sécurité de 0.5%
     order = binance.create_market_sell_order('BTC/USDC', quantity)
     print("🔴 Ordre de vente envoyé :", order)
+    revenue = order['cost'] - order['fee']['cost']
+    profit = revenue - (last_buy_price * quantity)
+    percent = (profit / (last_buy_price * quantity)) * 100 if last_buy_price else 0
 
-def simulate_buy(price):
-    global last_buy_price, trade_count
-    amount_usdc = portfolio['USDC']
-    if amount_usdc > 0:
-        btc_bought = (amount_usdc / price) * 0.999
-        portfolio['BTC'] = btc_bought
-        portfolio['USDC'] = 0
-        last_buy_price = price
-        value = btc_bought * price
-        log_trade("BUY", btc_bought, price, value)
-        trade_count += 1
-        print(f"Achat simulé : {btc_bought:.6f} BTC à {price} USDC")
-        if mode == "REAL":
-            real_buy(price)
+    if percent < MIN_PROFIT_PCT:
+        print(f"⏸️ Vente ignorée : gain trop faible ({percent:.2f}%)")
+        return
 
-def simulate_sell(price):
-    global last_buy_price, trade_count
-    amount_btc = portfolio['BTC']
-    if amount_btc > 0:
-        usdc_gained = (amount_btc * price) * 0.999
-        portfolio['USDC'] = usdc_gained
-        portfolio['BTC'] = 0
-        log_trade("SELL", amount_btc, price, usdc_gained)
-        trade_count += 1
-        if last_buy_price:
-            diff = price - last_buy_price
-            percent = (diff / last_buy_price) * 100
-            print(f"🟢 Gain/Pertes: {diff:.2f} USDC (+{percent:.2f}%)")
-            last_buy_price = None
-        print(f"Vente simulée : {usdc_gained:.2f} USDC à {price} USDC")
-        if mode == "REAL":
-            real_sell(price)
+    print(f"🟢 Gain/Pertes réel: {profit:.2f} USDC ({percent:.2f}%)")
+    log_trade("SELL", quantity, price, revenue)
 
-def analyse_finale(prix_actuel):
-    if mode == "REAL":
-        solde = get_real_balance()
-        total_usdc = solde['USDC'] + solde['BTC'] * prix_actuel
-        print("\n📊 Analyse finale (solde réel Binance)")
-    else:
-        total_usdc = portfolio['USDC'] + portfolio['BTC'] * prix_actuel
-        print("\n📊 Analyse finale (portefeuille fictif)")
+df = pd.DataFrame(columns=['timestamp', 'price', 'sma20', 'rsi', 'macd', 'macd_signal', 'bb_upper', 'bb_lower'])
+last_buy_price = None
+start_time = time.time()
 
-    profit = total_usdc - 1000
-    percent = (profit / 1000) * 100
-
-    print("-" * 30)
-    print(f"Trades simulés     : {trade_count}")
-    print(f"Valeur totale (USDC): {total_usdc:.2f}")
-    print(f"Profit / Perte     : {profit:.2f} USDC ({percent:.2f}%)")
-
-# === Boucle principale ===
 while True:
     price = get_price()
     if price is None:
         time.sleep(5)
         continue
 
-    timestamp = datetime.now().strftime("%H:%M:%S")
-    history.append(price)
-    timestamps.append(timestamp)
-    prices.append(price)
-
-    new_row = {'timestamp': datetime.now(timezone.utc), 'price': price}
+    new_row = {
+        'timestamp': datetime.now(timezone.utc),
+        'price': price,
+        'sma20': np.nan,
+        'rsi': np.nan,
+        'macd': np.nan,
+        'macd_signal': np.nan,
+        'bb_upper': np.nan,
+        'bb_lower': np.nan
+    }
     df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
     df = df.tail(100).reset_index(drop=True)
 
-    if mode == "REAL":
-        solde = get_real_balance()
-    else:
-        solde = portfolio
-
-    if solde['USDC'] < MIN_USDC and solde['BTC'] < MIN_BTC:
-        message = "🚨 Le bot s'est arrêté : solde insuffisant pour continuer à trader."
-        send_telegram(message)
+    balance = get_real_balance()
+    if balance['USDC'] < 10 and balance['BTC'] < 0.00001:
         print("❌ Solde insuffisant pour continuer. Le bot s'arrête.")
-        analyse_finale(price)
+        send_telegram("🚨 Bot arrêté : solde insuffisant.")
         break
 
     if len(df) >= 26:
@@ -201,22 +145,28 @@ while True:
         last_upper = df.iloc[-1]['bb_upper']
         last_lower = df.iloc[-1]['bb_lower']
 
-        if portfolio['USDC'] > 0 and last_rsi < 30 and price < last_lower and last_macd > last_signal:
-            simulate_buy(price)
-        elif portfolio['BTC'] > 0 and last_rsi > 70 and price > last_upper and last_macd < last_signal:
-            simulate_sell(price)
+        print(f"[INFO] RSI={last_rsi:.2f}, MACD={last_macd:.2f}, Signal={last_signal:.2f}, Bollinger=[{last_lower:.2f}, {last_upper:.2f}]")
+
+        # 🎯 Stratégie conservatrice
+        if balance['USDC'] > 10 and last_rsi < 30 and price < last_lower and last_macd > last_signal:
+            last_buy_price = real_buy(price)
+
+        elif balance['BTC'] > 0.00001 and last_rsi > 70 and price > last_upper and last_macd < last_signal:
+            real_sell(price, last_buy_price)
+
+        # 🔁 Stratégie active
+        elif balance['USDC'] > 10 and last_rsi < 45 and last_macd > last_signal:
+            last_buy_price = real_buy(price)
+
+        elif balance['BTC'] > 0.00001 and last_rsi > 60 and last_macd < last_signal:
+            real_sell(price, last_buy_price)
 
     print(f"Prix actuel : {price:.2f}")
-    print(f"👜 Solde : {solde}")
+    print(f"👜 Solde réel : {balance}")
 
-    elapsed = time.time() - start_time
-    if trade_count >= max_trades:
-        print("🛑 Limite de trades atteinte.")
-        analyse_finale(price)
-        break
-    if elapsed > max_runtime:
-        print("⏰ Durée maximale atteinte.")
-        analyse_finale(price)
+    if time.time() - start_time > 8 * 60 * 60:
+        print("⏰ Durée maximale atteinte. Le bot s'arrête.")
+        send_telegram("⏰ Bot arrêté : durée maximale atteinte.")
         break
 
-    time.sleep(10)
+    time.sleep(5)
